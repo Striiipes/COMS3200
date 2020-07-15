@@ -1,0 +1,564 @@
+#include <netdb.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <stdbool.h>
+
+/*** UNAUTHORISED USAGE OF THIS PROGRAM IS STRICTLY PROHITBITED. ***/
+
+/*** Server-side setup variables. ***/
+struct addrinfo* ai = 0; // Server information.
+struct addrinfo hints; // Support server.
+int serv; // Server number.
+int portNumber; // Server port number.
+struct sockaddr_in cliaddr; // Client information.
+struct timeval timeout = {4, 0}; // Packet timeout.
+
+/*** Client-packet setup variables. ***/
+int len; // Length of packet.
+char packetsSENT[1500][1500]; // Packets sent by server.
+int packCount; // Packet counter.
+int serverSequence; // Server sequence to client.
+int clientSequence; // Client sequence.
+bool checksumValid; // If checksum is in use or not.
+bool encodedValid; // If encoded is in use or not.
+
+/*** Function prototypes. ***/
+void setupServer(void);
+void recvPacket(void);
+bool checkGET(char* packet);
+void processGETPacket(char* packet);
+void retrieveGETPayload(char* payload, char* packet);
+void sendDATPayload(char* payload, char* packet);
+void timeOUTpacket(char* DATpacket);
+void decryptResponse(char* recvPacket, char* sentPacket);
+void retransmitDATPacket(char* packet);
+void sendFIN(char* packet);
+void sendFINACK(char* packet);
+bool validSequence(char* packetRecv, char* packetSent);
+void validFlags(char* packetRecv, char* packetSent);
+int computeChecksum(char* message);
+int carryAroundAdd(int a, int b);
+void validChecksum(char* payload, char* packet);
+void decryptPayload(char* payload, char* packet);
+void sendEmpty(char * packet);
+bool validAck(char* recvPacket, char* sentPacket);
+
+/*** Server set-up. ***/
+void setupServer(void) {
+	memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_INET; // IPv6 for generic could use AF_UNSEC.
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE; // For binding().
+    int err;
+    // Pick a random port.
+    if ((err = getaddrinfo("localhost", 0, &hints, &ai))) { 
+        freeaddrinfo(ai);
+        printf("Failed to find address\n");
+    }
+    // Create a socket and bind to it.
+    serv = socket(AF_INET, SOCK_DGRAM, 0);
+    if (bind(serv, (struct sockaddr*)ai->ai_addr, sizeof(struct sockaddr))) {
+        printf("Failed to bind\n");
+    }
+    struct sockaddr_in ad;
+    memset(&ad, 0, sizeof(struct sockaddr_in));
+    socklen_t len_test = sizeof(struct sockaddr_in);
+    if (getsockname(serv, (struct sockaddr*)&ad, &len_test)) {
+        printf("Socket error\n");
+    }
+    portNumber = ntohs(ad.sin_port);
+    printf("%u\n", ntohs(ad.sin_port)); // Print our port to the terminal.
+    fflush(stdout);
+	memset(&cliaddr, 0, sizeof(cliaddr));  // Setup client 
+}
+
+/*** Initial message from client (GET). ***/
+void recvPacket(void){
+	int packetType; 
+	char packet[1500]; // Maximum size of packets are 1500 bytes.
+	len = sizeof(cliaddr);
+	// Receive first packet from client.
+	packetType = recvfrom(serv, (char *)packet, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+	clientSequence++;
+	// Each transaction starts with a GET message.
+	if (checkGET(packet)) { // We have a GET message in the correct format.
+		processGETPacket(packet);
+	} else {
+		recvPacket();
+	}
+}
+
+/*** Checks the format of the initial GET packet. ***/
+bool checkGET(char* packet) {
+	if (packet[0] + packet[1] == 1) {
+		if (packet[2] + packet[3] == 0) {
+			if (packet[4] + packet[5] >= 0) {
+				if (packet[6] == 32) { // Neither ENC or CHK.
+					checksumValid = false;
+					encodedValid = false;
+					return true;
+				} else if (packet[6] == 36) { // CHK.
+					checksumValid = true;
+					encodedValid = false;
+					return true;
+				} else if (packet[6] == 34) { // ENC.
+					encodedValid = true;
+					checksumValid = false;
+					return true;
+				} else if (packet[6] == 38) { // ENC & CHK.
+					encodedValid = true;
+					checksumValid = true;
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/*** Process the GET packet sent by the client. ***/
+void processGETPacket(char* packet) {
+	int reconstructedPacket[1500];
+	int counter = 0;
+	int max = 1500; // Maximum number of bytes.
+	for (int i = 8; i < 1500; i++) {
+		if (packet[i] >= 29 && packet[i] <= 129) {
+			counter++;
+			reconstructedPacket[i - 8] = packet[i];
+		}
+	}					
+	char asciiPacket[1464];
+	// We have the constructed packet.
+	for (int i = 0; i < counter; i++) {
+		char convertASCII;
+		convertASCII = reconstructedPacket[i];
+		asciiPacket[i] = convertASCII;
+	}
+	char* payload = malloc(500);
+	strncpy(payload, asciiPacket, counter); // Payload: "files/file.txt"
+	if (checksumValid) {
+		validChecksum(payload, packet); // Check the checksum from client is valid.
+	}
+	if (encodedValid) { // Message is encoded.
+		decryptPayload(payload, packet);
+	} else {
+		retrieveGETPayload(payload, packet);
+	}
+}
+
+/*** Decrypts the file name. ***/
+void decryptPayload(char* payload, char* packet) {
+	char* decPayload = malloc(500);
+	for (int i = 0; i < strlen(payload); i++) {
+		decPayload[i] = payload[i] - 3;
+	}
+	retrieveGETPayload(decPayload, packet);
+}
+
+/*** Sends empty packets. ***/
+void sendEmpty(char * packet) {
+	sendFIN(packet);
+}
+
+/*** Retrieves the data requested by the client. ***/
+void retrieveGETPayload(char* payload, char* packet) {
+	FILE* file = fopen(payload, "r"); // Open requested file as read-only.
+	if (file == NULL) {
+		// Received an invalid name. Send empty packets.
+		sendEmpty(packet);
+	}
+	char* buffer = 0;
+	long length;
+	if (file) { // Read file into buffer.
+		fseek (file, 0, SEEK_END);
+		length = ftell (file);
+		fseek (file, 0, SEEK_SET);
+		buffer = malloc (length);
+		if (buffer) {
+			fread (buffer, 1, length, file);
+		}
+		fclose (file);
+	}
+	sendDATPayload(buffer, packet);
+}
+
+/*** Send DAT back to client. ***/
+void sendDATPayload(char* payload, char* packet) { 
+	// If the packet is greater than 1464, we send multiple DAT responses.
+	int counter = 0;
+	for (int i = 0; payload[i] != '\0'; i++) { // Check how many bytes we need to send.
+		counter++;
+	}
+	if (counter > 1464) { // Need to send more than one packet.
+		int globalIterator = 0;
+		int ackNumber = packet[1];
+		// How many packets do we need to send?
+		float numberOfPackets = (float) counter / 1464.0;
+		double res = (double)(int)(numberOfPackets + 0.5);
+		int numOfPackets = res;
+		for (int i = 0; i < numOfPackets; i++) {
+			// We will send the packet, numOfPackets amount of times.
+			char* DATpacket = malloc(5000);
+			serverSequence++;
+			DATpacket[0] = 0;
+			DATpacket[1] = serverSequence; // Set server sequence.
+			DATpacket[2] = 0;
+			DATpacket[3] = 0; // Ack values. (ACK isn't set).
+			if (!checksumValid && !encodedValid) {
+				DATpacket[4] = 0;
+				DATpacket[5] = 0; // Checksum values.
+				DATpacket[6] = 16; // DAT.
+			}
+			DATpacket[7] = 1; // Always 1. 
+			for (int i = 0; i < 1464; i++) {
+				if (payload[globalIterator] != '\0') {
+					if (!encodedValid) {
+						DATpacket[i + 8] = payload[globalIterator];
+						globalIterator++;
+					} else {
+						DATpacket[i + 8] = payload[globalIterator] + 3; // Encode the message.
+						globalIterator++;
+					}
+				} else {
+					DATpacket[i + 8] = 0; // Pad up the rest of the packet.
+				}
+			}
+			if (checksumValid && !encodedValid) { // Validate checksum flags. No encoding.
+				int check = computeChecksum(DATpacket + 8);
+				int hi = ((check >> 8) & 0xff);
+				int lo = ((check >> 0 ) & 0xff);
+				DATpacket[4] = hi;
+				DATpacket[5] = lo;
+				DATpacket[6] = 20; // DAT/CHECK uses 20.
+			} else if (!checksumValid && encodedValid) { // Encoding used. No checksum.
+				DATpacket[4] = 0;
+				DATpacket[5] = 0; // Checksum values.
+				DATpacket[6] = 18; // DAT.
+			} else if (checksumValid && encodedValid) { // Both ENC & CHK.
+				int check = computeChecksum(DATpacket + 8);
+				int hi = ((check >> 8) & 0xff);
+				int lo = ((check >> 0 ) & 0xff);
+				DATpacket[4] = hi;
+				DATpacket[5] = lo;
+				DATpacket[6] = 22; // DAT/CHECK uses 20.
+			}
+			sendto(serv, DATpacket, 1472, 0, (struct sockaddr *) & cliaddr, len);
+			// Keep a copy.
+			for (int i = 0; i < 1500; i++) {
+				packetsSENT[packCount][i] = DATpacket[i];
+			}
+			packCount++;
+			// Check that we recieve an ACK within 4 seconds.
+			timeOUTpacket(DATpacket);
+		}
+		
+	} else {
+		char* DATpacket = malloc(5000);
+		serverSequence++;
+		DATpacket[0] = 0;
+		DATpacket[1] = serverSequence; // Set server sequence.
+		DATpacket[2] = 0;
+		DATpacket[3] = 0; // Ack values. (ACK isn't set).
+		if (!checksumValid && !encodedValid) {
+			DATpacket[4] = 0;
+			DATpacket[5] = 0; // Checksum values.
+			DATpacket[6] = 16; // DAT.
+		}
+		DATpacket[7] = 1; // Always 1. 
+		for (int i = 0; i < 1464; i++) {
+			if (payload[i] != '\0') {
+				if (!encodedValid) {
+					DATpacket[i + 8] = payload[i];
+				} else {
+					DATpacket[i + 8] = payload[i] + 3; // Encode the message.
+				}
+			} else {
+				DATpacket[i + 8] = 0; // Pad up the rest of the packet.
+			}
+		}
+		if (checksumValid && !encodedValid) { // Validate checksum flags. No encoding.
+			int check = computeChecksum(DATpacket + 8);
+			int hi = ((check >> 8) & 0xff);
+			int lo = ((check >> 0 ) & 0xff);
+			DATpacket[4] = hi;
+			DATpacket[5] = lo;
+			DATpacket[6] = 20; // DAT/CHECK uses 20.
+		} else if (!checksumValid && encodedValid) { // Encoding used. No checksum.
+			DATpacket[4] = 0;
+			DATpacket[5] = 0; // Checksum values.
+			DATpacket[6] = 18; // DAT.
+		} else if (checksumValid && encodedValid) { // Both ENC & CHK.
+			int check = computeChecksum(DATpacket + 8);
+			int hi = ((check >> 8) & 0xff);
+			int lo = ((check >> 0 ) & 0xff);
+			DATpacket[4] = hi;
+			DATpacket[5] = lo;
+			DATpacket[6] = 22; // DAT/CHECK uses 20.
+		}
+		sendto(serv, DATpacket, 1472, 0, (struct sockaddr *) & cliaddr, len);
+		// Keep a copy.
+		for (int i = 0; i < 1500; i++) {
+			packetsSENT[packCount][i] = DATpacket[i];
+		}
+		packCount++;
+		// Check that we recieve an ACK within 4 seconds.
+		timeOUTpacket(DATpacket);
+	}
+	sendFIN(packet);
+}
+
+/*** Ensures that a response is recevied within 4 seconds, otherwise re-transmits. ***/
+void timeOUTpacket(char* DATpacket) {
+	char recvPacket[1500];
+	while (1) {
+		setsockopt(serv, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(struct timeval));
+		int packetType = recvfrom(serv, (char *)recvPacket, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+		clientSequence++;
+		if (packetType >= 0) {
+			decryptResponse(recvPacket, DATpacket);
+			break;
+		} else {
+			sendto(serv, DATpacket, 1472, 0, (struct sockaddr *) & cliaddr, len);
+			clientSequence--;
+		}
+	}
+}
+
+/*** Retrieve possible flags from client. ***/
+void decryptResponse(char* recvPacket, char* sentPacket) {
+	if (validSequence(recvPacket, sentPacket)) {
+		if (validAck(recvPacket, sentPacket)) {
+			validFlags(recvPacket, sentPacket);
+		}
+	}
+}
+
+/*** Re-send any corrupted packets to the client. ***/
+void retransmitDATPacket(char* packet) {
+	// The NAK packet’s acknowledgement number will contain the sequence number it was expecting.
+	for (int i = 0; i < packCount; i++) {
+		if (packet[3] == packetsSENT[i][1]) { // We have found the packet that needs to be retrasnmitted.
+			sendto(serv, packetsSENT[i], 1472, 0, (struct sockaddr *) & cliaddr, len);
+			timeOUTpacket(packetsSENT[i]);
+		}
+	}
+	// Keep a copy of retransmitted packets, just in case.
+	for (int i = 0; i < 1500; i++) {
+		packetsSENT[packCount][i] = packetsSENT[packCount][i];
+	}
+	packCount++;
+	
+}
+
+/*** Initiate closing the connection with the client. ***/
+void sendFIN(char* packet) {
+	// We are sending a packet, so we increment our sent counter.
+	serverSequence++;
+	char FINpacket[1500];
+	FINpacket[0] = 0;
+	FINpacket[1] = serverSequence; // Set server sequence.
+	FINpacket[2] = 0;
+	FINpacket[3] = 0; // Ack values. (ACK isn't set).
+	if (checksumValid == false && !encodedValid) {
+		FINpacket[4] = 0;
+		FINpacket[5] = 0; // Checksum values.
+		FINpacket[6] = 8; // FIN.
+	} else if (checksumValid && !encodedValid) {
+		FINpacket[4] = 255;
+		FINpacket[5] = 255; // Checksum values.
+		FINpacket[6] = 12; // FIN/CHK.
+	} else if (!checksumValid && encodedValid) {
+		FINpacket[4] = 0;
+		FINpacket[5] = 0; // Checksum values.
+		FINpacket[6] = 10; // FIN/CHK.
+	} else if (checksumValid && encodedValid) {
+		FINpacket[4] = 255;
+		FINpacket[5] = 255; // Checksum values.
+		FINpacket[6] = 14; 
+	}
+	FINpacket[7] = 1; // Always 1.
+	for (int i = 0; i < 1464; i++) {
+		FINpacket[i + 8] = 0;
+	}	
+	// Send FIN response.
+	sendto(serv, FINpacket, 1472, 0, (struct sockaddr *) & cliaddr, len);
+	timeOUTpacket(FINpacket);
+	// Keep a copy of any packets we have sent in case we need to retransmit.
+	for (int i = 0; i < 1500; i++) {
+		packetsSENT[packCount][i] = FINpacket[i];
+	}
+	packCount++;
+}
+
+/*** Send the final FIN/ACK packet to client, and close the connection. ***/
+void sendFINACK(char* packet) {
+	// We are sending a packet, so we increment our sent counter.
+	serverSequence++;
+	char FINpacket[1500];
+	FINpacket[0] = 0;
+	FINpacket[1] = serverSequence; // Set server sequence.
+	FINpacket[2] = packet[0] * 256;
+	FINpacket[3] = packet[1]; // Ack values.
+	if (!checksumValid && !encodedValid) {
+		FINpacket[4] = 0;
+		FINpacket[5] = 0; // Checksum values.
+		FINpacket[6] = -120; // FINACK.
+	} else if (checksumValid && !encodedValid) {
+		FINpacket[4] = 255;
+		FINpacket[5] = 255; // Checksum values.
+		FINpacket[6] = -116;
+	} else if (!checksumValid && encodedValid) {
+		FINpacket[4] = 0;
+		FINpacket[5] = 0; // Checksum values.
+		FINpacket[6] = -118;
+	} else if (checksumValid && encodedValid) {
+		FINpacket[4] = 255;
+		FINpacket[5] = 255; // Checksum values.
+		FINpacket[6] = -114;
+	}
+	FINpacket[7] = 1; // Always 1.
+	for (int i = 0; i < 1464; i++) {
+		FINpacket[i + 8] = 0;
+	}	
+	// SEND FIN/ACK response.
+	sendto(serv, FINpacket, 1472, 0, (struct sockaddr *) & cliaddr, len);
+	// Keep a copy of any packets we have sent in case we need to retransmit.
+	for (int i = 0; i < 1500; i++) {
+		packetsSENT[packCount][i] = FINpacket[i];
+	}
+	packCount++;
+	exit(0); // Terminate connection.
+}
+
+/*** Checks that the sequence is valid. ***/
+bool validSequence(char* packetRecv, char* packetSent) { 
+	if (packetRecv[1] != clientSequence) {
+		char next[1500];
+		sendto(serv, packetSent, 1472, 0, (struct sockaddr *) & cliaddr, len);
+		int packetType = recvfrom(serv, (char *)next, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+		validSequence(next, packetSent);
+	} else {
+		return true;
+	}
+}
+
+/*** Checks that the flags are valid. ***/
+void validFlags(char* packetRecv, char* packetSent) {
+	// Checks for ACK/DAT, FIN/ACK, NAK/DAT, NAK/FIN
+	if (encodedValid && checksumValid) {
+		if (packetRecv[6] != -106 && packetRecv[6] != -114 && packetRecv[6] != 86 && packetRecv[6] != 78) { 
+			char next[1500];
+			sendto(serv, packetSent, 1472, 0, (struct sockaddr *) & cliaddr, len);
+			int packetType = recvfrom(serv, (char *)next, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+			validFlags(next, packetSent);
+		} else {
+			if (packetRecv[6] == -114) { // FIN/ACK, send reply.
+				sendFINACK(packetRecv);
+			} else if (packetRecv[6] == 86) { // NAK, re-send packet.
+				retransmitDATPacket(packetRecv);
+			} else if (packetRecv[6] == 78) { // NAK/FIN.
+				sendFIN(packetRecv);
+			}
+		}
+	} else if (!encodedValid && checksumValid) {
+		if (packetRecv[6] != -108 && packetRecv[6] != -116 && packetRecv[6] != 84 && packetRecv[6] != 76) {
+			char next[1500];
+			sendto(serv, packetSent, 1472, 0, (struct sockaddr *) & cliaddr, len);
+			int packetType = recvfrom(serv, (char *)next, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+			validFlags(next, packetSent);
+		} else {
+			if (packetRecv[6] == -116) { // FIN/ACK, send reply.
+				sendFINACK(packetRecv);
+			} else if (packetRecv[6] == 84) { // NAK, re-send packet.
+				retransmitDATPacket(packetRecv);
+			} else if (packetRecv[6] == 76) { // NAK/FIN.
+				sendFIN(packetRecv);
+			}
+		}
+	} else if (encodedValid && !checksumValid) {
+		if (packetRecv[6] != -110 && packetRecv[6] != -118 && packetRecv[6] != 82 && packetRecv[6] != 74) {
+			char next[1500];
+			sendto(serv, packetSent, 1472, 0, (struct sockaddr *) & cliaddr, len);
+			int packetType = recvfrom(serv, (char *)next, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+			validFlags(next, packetSent);
+		} else {
+			if (packetRecv[6] == -118) { // FIN/ACK, send reply.
+				sendFINACK(packetRecv);
+			} else if (packetRecv[6] == 82) { // NAK, re-send packet.
+				retransmitDATPacket(packetRecv);
+			} else if (packetRecv[6] == 74) { // NAK/FIN
+				sendFIN(packetRecv);
+			}
+		}
+	} else if (!encodedValid && !checksumValid) {
+		if (packetRecv[6] != -112 && packetRecv[6] != -120 && packetRecv[6] != 80 && packetRecv[6] != 72) {
+			char next[1500];
+			sendto(serv, packetSent, 1472, 0, (struct sockaddr *) & cliaddr, len);
+			int packetType = recvfrom(serv, (char *)next, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+			validFlags(next, packetSent);
+		} else {
+			if (packetRecv[6] == -120) { // FIN/ACK, send reply.
+				sendFINACK(packetRecv);
+			} else if (packetRecv[6] == 80) { // NAK, re-send packet.
+				retransmitDATPacket(packetRecv);
+			} else if (packetRecv[6] == 72) { // NAK/FIN
+				sendFIN(packetRecv);
+			}
+		}
+	}
+}
+
+/*** Checks that the ACK is valid. ***/
+bool validAck(char* packetRecv, char* packetSent) {
+	if (packetRecv[3] > packCount && packetRecv[6] != -120 && packetRecv[6] != -118 && packetRecv[6] != -116 && packetRecv[6] != -114) {
+		char next[1500];
+		sendto(serv, packetSent, 1472, 0, (struct sockaddr *) & cliaddr, len);
+		int packetType = recvfrom(serv, (char *)next, 1500, 0, (struct sockaddr *) & cliaddr, &len);
+		validAck(next, packetSent);
+	} else {
+		return true;
+	}
+}
+
+/*** Computes the carry for checksum. ***/
+int carryAroundAdd(int a, int b) {
+	int c = a + b;
+	return (c & 0xffff) + (c >> 16);
+}
+
+/*** Calculates the checksum. ***/
+int computeChecksum(char* message) {
+	char* modified = malloc(5000);
+	strcpy(modified, message);
+	modified = modified + 8;
+	if (strlen(modified) % 2 == 1) {
+		int x = strlen(modified);
+		modified[x+1] = '\0';
+	} 
+	int checksum = 0;
+	for (int i = 0; i < strlen(message); i = i + 2) {
+		int w = message[i] + (message[i + 1] << 8);
+		checksum = carryAroundAdd(checksum, w);
+	}
+	return ~checksum & 0xffff;
+}
+
+/*** Checks that the checksum is valid. ***/
+void validChecksum(char* payload, char* packet) {
+	int recvdPayload = (packet[4] * 256) + packet[5];
+	int calcPayload = computeChecksum(payload);
+	if (recvdPayload != calcPayload) {
+		// Timeout the connection.
+		recvPacket();
+	}
+}
+
+int main(int argc, char** argv) {
+	serverSequence = 0;
+	packCount = 0;
+	clientSequence = 0;
+	setupServer();
+	recvPacket();
+}
